@@ -135,7 +135,7 @@ class App:
         try:
             self._logo_img = tk.PhotoImage(file=_logo_path)
             self.root.iconphoto(True, self._logo_img)
-            self._logo_small = self._logo_img.subsample(12)
+            self._logo_small = self._logo_img.subsample(6)
         except Exception:
             self._logo_img = None
             self._logo_small = None
