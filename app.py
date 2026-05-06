@@ -212,6 +212,11 @@ class App:
         self._stop_hotkey_thread()
         self.root.destroy()
 
+    def _sync_ui(self):
+        self._rebuild_my_windows_ui()
+        self._rebuild_select_ui()
+        self._register_hotkeys()
+
     # ── Presets ───────────────────────────────────────────────────────────────
 
     def _load_presets(self):
@@ -247,9 +252,7 @@ class App:
         titles    = self.presets.get(name, [])
         title_map = {t: h for h, t in self.all_wins}
         self.selected = [{"hwnd": title_map.get(t, 0), "title": t} for t in titles]
-        self._rebuild_my_windows_ui()
-        self._rebuild_select_ui()
-        self._register_hotkeys()
+        self._sync_ui()
 
     def _delete_preset(self, name):
         if messagebox.askyesno("Delete", f'Delete preset "{name}"?', parent=self.root):
@@ -264,18 +267,14 @@ class App:
         title_map = {t: h for h, t in self.all_wins}
         for w in self.selected:
             w["hwnd"] = title_map.get(w["title"], 0)
-        self._rebuild_my_windows_ui()
-        self._rebuild_select_ui()
-        self._register_hotkeys()
+        self._sync_ui()
 
     def _toggle_window(self, hwnd, title):
         if any(w["hwnd"] == hwnd for w in self.selected):
             self.selected = [w for w in self.selected if w["hwnd"] != hwnd]
         else:
             self.selected.append({"hwnd": hwnd, "title": title})
-        self._rebuild_my_windows_ui()
-        self._rebuild_select_ui()
-        self._register_hotkeys()
+        self._sync_ui()
 
     def _move(self, index, direction):
         target = index + direction
@@ -287,9 +286,7 @@ class App:
 
     def _remove_selected(self, hwnd):
         self.selected = [w for w in self.selected if w["hwnd"] != hwnd]
-        self._rebuild_my_windows_ui()
-        self._rebuild_select_ui()
-        self._register_hotkeys()
+        self._sync_ui()
 
     # ── UI build (once) ───────────────────────────────────────────────────────
 
@@ -308,13 +305,9 @@ class App:
 
         if self._logo_small:
             tk.Label(inner, image=self._logo_small, bg=C_SURFACE).pack(side=tk.LEFT)
-            tk.Label(inner, text="  WinPilotX",
-                     bg=C_SURFACE, fg=C_TITLE,
-                     font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
-        else:
-            tk.Label(inner, text="WinPilotX",
-                     bg=C_SURFACE, fg=C_TITLE,
-                     font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
+        tk.Label(inner, text="WinPilotX",
+                 bg=C_SURFACE, fg=C_TITLE,
+                 font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=(8, 0))
 
         ref_btn = tk.Button(inner, text="↻  Refresh", command=self.refresh,
                             bg=C_NAV, fg=C_TEXT,
@@ -586,11 +579,11 @@ class App:
         def on_enter(e, ws=hover_targets):
             for w in ws:
                 try: w.config(bg=C_HOVER)
-                except: pass
+                except tk.TclError: pass
         def on_leave(e, ws=hover_targets):
             for w in ws:
                 try: w.config(bg=C_SURFACE)
-                except: pass
+                except tk.TclError: pass
 
         on_click = lambda e, h=hwnd, t=title: self._toggle_window(h, t)
         for w in [row, inner, dot, lbl, strip]:
