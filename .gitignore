@@ -1,5 +1,6 @@
 # Runtime data
 presets.json
+config.json
 
 # Python
 __pycache__/

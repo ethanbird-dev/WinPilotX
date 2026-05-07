@@ -13,6 +13,8 @@ import os
 
 MOD_CONTROL = 0x0002
 MOD_ALT     = 0x0001
+MOD_SHIFT   = 0x0004
+MOD_WIN     = 0x0008
 WM_HOTKEY   = 0x0312
 WM_QUIT     = 0x0012
 user32      = ctypes.windll.user32
@@ -20,31 +22,38 @@ kernel32    = ctypes.windll.kernel32
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PRESETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
+_DIR         = os.path.dirname(os.path.abspath(__file__))
+PRESETS_FILE = os.path.join(_DIR, "presets.json")
+CONFIG_FILE  = os.path.join(_DIR, "config.json")
 MAX_HOTKEYS  = 8
+
+DEFAULT_HOTKEYS = [
+    {"modifier": MOD_CONTROL | MOD_ALT, "key": str(i + 1)}
+    for i in range(MAX_HOTKEYS)
+]
 
 # ── Color palette (GitHub Dark / Linear inspired) ─────────────────────────────
 
-C_BG         = "#0d1117"   # window background
-C_SURFACE    = "#161b22"   # card / row surface
-C_HOVER      = "#1c2230"   # row hover state
-C_BORDER     = "#21262d"   # subtle borders
-C_ACCENT     = "#58a6ff"   # primary blue
-C_ACCENT_BG  = "#1c2d3f"   # accent-tinted bg (Switch button)
-C_ACCENT_HV  = "#243a52"   # Switch button hover
-C_GREEN      = "#3fb950"   # alive / active dot
-C_GRAY_DOT   = "#30363d"   # inactive dot
-C_RED        = "#f85149"   # danger / remove
-C_RED_HV     = "#3d1a1a"   # remove button hover bg
-C_AMBER      = "#e3b341"   # hotkey badge text
-C_AMBER_BG   = "#2b1f00"   # hotkey badge bg
-C_TEXT       = "#e6edf3"   # primary text
-C_MUTED      = "#8b949e"   # secondary text
-C_TITLE      = "#79c0ff"   # header title
-C_NAV        = "#21262d"   # nav / utility button bg
-C_NAV_HV     = "#30363d"   # nav button hover
-C_PRESET_BG  = "#1c2d3f"   # preset chip bg
-C_PRESET_HV  = "#243a52"   # preset chip hover
+C_BG         = "#0d1117"
+C_SURFACE    = "#161b22"
+C_HOVER      = "#1c2230"
+C_BORDER     = "#21262d"
+C_ACCENT     = "#58a6ff"
+C_ACCENT_BG  = "#1c2d3f"
+C_ACCENT_HV  = "#243a52"
+C_GREEN      = "#3fb950"
+C_GRAY_DOT   = "#30363d"
+C_RED        = "#f85149"
+C_RED_HV     = "#3d1a1a"
+C_AMBER      = "#e3b341"
+C_AMBER_BG   = "#2b1f00"
+C_TEXT       = "#e6edf3"
+C_MUTED      = "#8b949e"
+C_TITLE      = "#79c0ff"
+C_NAV        = "#21262d"
+C_NAV_HV     = "#30363d"
+C_PRESET_BG  = "#1c2d3f"
+C_PRESET_HV  = "#243a52"
 
 # ── Win32 window helpers ──────────────────────────────────────────────────────
 
@@ -70,6 +79,19 @@ def focus_window(hwnd):
 
 def is_window_alive(hwnd):
     return bool(hwnd) and win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd)
+
+
+def _keysym_to_vk(keysym):
+    """Convert a Tkinter keysym to a Windows virtual-key code, or None if unsupported."""
+    if len(keysym) == 1:
+        code = ord(keysym.upper())
+        if 65 <= code <= 90 or 48 <= code <= 57:  # A–Z, 0–9
+            return code
+    if len(keysym) >= 2 and keysym[0] == "F" and keysym[1:].isdigit():
+        n = int(keysym[1:])
+        if 1 <= n <= 24:
+            return 0x70 + (n - 1)  # VK_F1 = 0x70
+    return None
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 
@@ -102,10 +124,6 @@ def _hover(widget, normal_bg, hover_bg, normal_fg=None, hover_fg=None):
 
 
 def _scrollable_area(parent, bg):
-    """
-    Create a Canvas + scrollbar pair. Returns (canvas, inner_frame, win_id).
-    Caller is responsible for packing canvas and scrollbar.
-    """
     canvas = tk.Canvas(parent, bg=bg, highlightthickness=0)
     sb     = ttk.Scrollbar(parent, orient="vertical",
                             command=canvas.yview, style="Dark.Vertical.TScrollbar")
@@ -131,7 +149,7 @@ class App:
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "winpilotxlogo.png")
+        _logo_path = os.path.join(_DIR, "winpilotxlogo.png")
         try:
             self._logo_img = tk.PhotoImage(file=_logo_path)
             self.root.iconphoto(True, self._logo_img)
@@ -142,9 +160,9 @@ class App:
 
         _setup_scrollbar_style()
 
-        self.presets  = {}   # { name: [title, ...] }
-        self.selected = []   # [{ hwnd, title }] — ordered by user
-        self.all_wins = []   # [(hwnd, title)]
+        self.presets  = {}
+        self.selected = []
+        self.all_wins = []
 
         # Hotkey thread state
         self._sw_queue     = queue.Queue()
@@ -153,6 +171,7 @@ class App:
         self._hk_id_ready  = threading.Event()
 
         self._load_presets()
+        self._load_config()
         self._build_ui()
         self.refresh()
         self._poll_switch_queue()
@@ -165,7 +184,7 @@ class App:
             self._hk_id_ready.clear()
             self._hk_thread = threading.Thread(
                 target=self._hotkey_loop,
-                args=(list(self.selected),),
+                args=(list(self.selected), list(self.hotkey_config)),
                 daemon=True)
             self._hk_thread.start()
 
@@ -177,16 +196,22 @@ class App:
         self._hk_thread    = None
         self._hk_thread_id = None
 
-    def _hotkey_loop(self, windows):
+    def _hotkey_loop(self, windows, hotkey_cfg):
         self._hk_thread_id = kernel32.GetCurrentThreadId()
         self._hk_id_ready.set()
         registered = []
         for i, win in enumerate(windows[:MAX_HOTKEYS]):
-            if win["hwnd"]:
-                hk_id = i + 1
-                vk    = ord(str(i + 1))
-                if user32.RegisterHotKey(None, hk_id, MOD_CONTROL | MOD_ALT, vk):
-                    registered.append(hk_id)
+            if not win["hwnd"]:
+                continue
+            cfg = hotkey_cfg[i] if i < len(hotkey_cfg) else None
+            if not cfg or not cfg.get("key") or cfg.get("modifier", 0) == 0:
+                continue
+            vk = _keysym_to_vk(cfg["key"])
+            if vk is None:
+                continue
+            hk_id = i + 1
+            if user32.RegisterHotKey(None, hk_id, cfg["modifier"], vk):
+                registered.append(hk_id)
         msg = ctypes.wintypes.MSG()
         while True:
             result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
@@ -217,6 +242,39 @@ class App:
         self._rebuild_select_ui()
         self._register_hotkeys()
 
+    # ── Config ────────────────────────────────────────────────────────────────
+
+    def _load_config(self):
+        self.hotkey_config = [dict(h) for h in DEFAULT_HOTKEYS]
+        if not os.path.exists(CONFIG_FILE):
+            return
+        try:
+            with open(CONFIG_FILE) as f:
+                data = json.load(f)
+            for i, entry in enumerate(data.get("hotkeys", [])[:MAX_HOTKEYS]):
+                if isinstance(entry, dict) and "modifier" in entry and "key" in entry:
+                    self.hotkey_config[i] = entry
+        except Exception:
+            pass
+
+    def _write_config(self):
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"hotkeys": self.hotkey_config}, f, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+
+    def _combo_str(self, modifier, key):
+        """Return a display string for a hotkey combo, e.g. 'Ctrl+Alt+1'."""
+        if not key or modifier == 0:
+            return "None"
+        parts = []
+        if modifier & MOD_WIN:     parts.append("Win")
+        if modifier & MOD_CONTROL: parts.append("Ctrl")
+        if modifier & MOD_ALT:     parts.append("Alt")
+        if modifier & MOD_SHIFT:   parts.append("Shift")
+        parts.append(key.upper() if len(key) == 1 else key)
+        return "+".join(parts)
+
     # ── Presets ───────────────────────────────────────────────────────────────
 
     def _load_presets(self):
@@ -228,8 +286,10 @@ class App:
                 self.presets = {}
 
     def _write_presets(self):
-        with open(PRESETS_FILE, "w") as f:
+        tmp = PRESETS_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(self.presets, f, indent=2)
+        os.replace(tmp, PRESETS_FILE)
 
     def _save_as_preset(self):
         if not self.selected:
@@ -240,6 +300,14 @@ class App:
         if not name or not name.strip():
             return
         name = name.strip()
+        if len(name) > 100:
+            messagebox.showerror("Invalid name",
+                "Preset name must be 100 characters or fewer.", parent=self.root)
+            return
+        if any(ord(c) < 32 for c in name):
+            messagebox.showerror("Invalid name",
+                "Preset name contains invalid characters.", parent=self.root)
+            return
         if name in self.presets:
             if not messagebox.askyesno("Overwrite?",
                     f'"{name}" already exists. Overwrite?', parent=self.root):
@@ -263,11 +331,19 @@ class App:
     # ── Window list ───────────────────────────────────────────────────────────
 
     def refresh(self):
-        self.all_wins = get_all_windows()
+        self._refresh_btn.config(state=tk.DISABLED, text="↻  Refreshing…")
+        def _worker():
+            wins = get_all_windows()
+            self.root.after(0, lambda: self._finish_refresh(wins))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_refresh(self, wins):
+        self.all_wins = wins
         title_map = {t: h for h, t in self.all_wins}
         for w in self.selected:
             w["hwnd"] = title_map.get(w["title"], 0)
         self._sync_ui()
+        self._refresh_btn.config(state=tk.NORMAL, text="↻  Refresh")
 
     def _toggle_window(self, hwnd, title):
         if any(w["hwnd"] == hwnd for w in self.selected):
@@ -299,7 +375,6 @@ class App:
         hdr = tk.Frame(self.root, bg=C_SURFACE, pady=0)
         hdr.pack(fill=tk.X)
 
-        # Inner padding frame
         inner = tk.Frame(hdr, bg=C_SURFACE, pady=14, padx=18)
         inner.pack(fill=tk.X)
 
@@ -309,15 +384,14 @@ class App:
                  bg=C_SURFACE, fg=C_TITLE,
                  font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=(8, 0))
 
-        ref_btn = tk.Button(inner, text="↻  Refresh", command=self.refresh,
-                            bg=C_NAV, fg=C_TEXT,
-                            activebackground=C_NAV_HV, activeforeground=C_TEXT,
-                            relief=tk.FLAT, padx=14, pady=6,
-                            font=("Segoe UI", 9), cursor="hand2")
-        ref_btn.pack(side=tk.RIGHT)
-        _hover(ref_btn, C_NAV, C_NAV_HV)
+        self._refresh_btn = tk.Button(inner, text="↻  Refresh", command=self.refresh,
+                                      bg=C_NAV, fg=C_TEXT,
+                                      activebackground=C_NAV_HV, activeforeground=C_TEXT,
+                                      relief=tk.FLAT, padx=14, pady=6,
+                                      font=("Segoe UI", 9), cursor="hand2")
+        self._refresh_btn.pack(side=tk.RIGHT)
+        _hover(self._refresh_btn, C_NAV, C_NAV_HV)
 
-        # Bottom border
         tk.Frame(hdr, bg=C_BORDER, height=1).pack(fill=tk.X)
 
     def _build_preset_bar(self):
@@ -329,11 +403,11 @@ class App:
         tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X)
 
     def _build_tabs(self):
-        # Tab bar
+        self._active_tab = "my"
+
         tab_bar = tk.Frame(self.root, bg=C_BG)
         tab_bar.pack(fill=tk.X)
 
-        # Tab wrapper: button + 2px underline indicator
         def _tab_wrap(label, tab_id):
             wrap = tk.Frame(tab_bar, bg=C_BG)
             wrap.pack(side=tk.LEFT)
@@ -349,37 +423,54 @@ class App:
             ind.pack(fill=tk.X)
             return btn, ind
 
-        self._btn_my,  self._ind_my  = _tab_wrap("My Windows",      "my")
-        self._btn_sel, self._ind_sel = _tab_wrap("Select Windows",   "select")
+        self._btn_my,       self._ind_my       = _tab_wrap("My Windows",    "my")
+        self._btn_sel,      self._ind_sel      = _tab_wrap("Select Windows", "select")
+        self._btn_settings, self._ind_settings = _tab_wrap("Settings",      "settings")
 
         tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X)
 
-        # Tab content frames
-        self._my_tab  = self._build_my_tab()
-        self._sel_tab = self._build_sel_tab()
+        self._my_tab       = self._build_my_tab()
+        self._sel_tab      = self._build_sel_tab()
+        self._settings_tab = self._build_settings_tab()
+
+        # Single routed handler — replaces the two bind_all calls that caused double-scrolling
+        def _on_scroll(event):
+            if self._active_tab == "my":
+                self._my_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+            elif self._active_tab == "select":
+                self._sel_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        self.root.bind_all("<MouseWheel>", _on_scroll)
 
         self._switch_tab("my")
 
     def _switch_tab(self, tab):
+        self._active_tab = tab
+        self._my_tab.pack_forget()
+        self._sel_tab.pack_forget()
+        self._settings_tab.pack_forget()
+        for btn, ind in [
+            (self._btn_my,       self._ind_my),
+            (self._btn_sel,      self._ind_sel),
+            (self._btn_settings, self._ind_settings),
+        ]:
+            btn.config(fg=C_MUTED, font=("Segoe UI", 10))
+            ind.config(bg=C_BG)
         if tab == "my":
             self._my_tab.pack(fill=tk.BOTH, expand=True)
-            self._sel_tab.pack_forget()
             self._btn_my.config(fg=C_TEXT, font=("Segoe UI", 10, "bold"))
             self._ind_my.config(bg=C_ACCENT)
-            self._btn_sel.config(fg=C_MUTED, font=("Segoe UI", 10))
-            self._ind_sel.config(bg=C_BG)
-        else:
+        elif tab == "select":
             self._sel_tab.pack(fill=tk.BOTH, expand=True)
-            self._my_tab.pack_forget()
             self._btn_sel.config(fg=C_TEXT, font=("Segoe UI", 10, "bold"))
             self._ind_sel.config(bg=C_ACCENT)
-            self._btn_my.config(fg=C_MUTED, font=("Segoe UI", 10))
-            self._ind_my.config(bg=C_BG)
+        elif tab == "settings":
+            self._settings_tab.pack(fill=tk.BOTH, expand=True)
+            self._btn_settings.config(fg=C_TEXT, font=("Segoe UI", 10, "bold"))
+            self._ind_settings.config(bg=C_ACCENT)
 
     def _build_my_tab(self):
         frame = tk.Frame(self.root, bg=C_BG)
 
-        # Toolbar
         toolbar = tk.Frame(frame, bg=C_BG, pady=10, padx=18)
         toolbar.pack(fill=tk.X)
         tk.Label(toolbar, text="MY WINDOWS", bg=C_BG, fg=C_MUTED,
@@ -393,15 +484,12 @@ class App:
         save_btn.pack(side=tk.RIGHT)
         _hover(save_btn, C_ACCENT_BG, C_ACCENT_HV)
 
-        # Scrollable list
         container = tk.Frame(frame, bg=C_BG)
         container.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
         self._my_canvas, my_sb, self._my_inner, self._my_win_id = \
             _scrollable_area(container, C_BG)
 
-        self._my_canvas.bind_all("<MouseWheel>",
-            lambda e: self._my_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
         self._my_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         my_sb.pack(side=tk.RIGHT, fill=tk.Y)
         return frame
@@ -420,11 +508,160 @@ class App:
         self._sel_canvas, sel_sb, self._sel_inner, self._sel_win_id = \
             _scrollable_area(container, C_BG)
 
-        self._sel_canvas.bind_all("<MouseWheel>",
-            lambda e: self._sel_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
         self._sel_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sel_sb.pack(side=tk.RIGHT, fill=tk.Y)
         return frame
+
+    def _build_settings_tab(self):
+        frame = tk.Frame(self.root, bg=C_BG)
+
+        toolbar = tk.Frame(frame, bg=C_BG, pady=10, padx=18)
+        toolbar.pack(fill=tk.X)
+        tk.Label(toolbar,
+                 text="HOTKEY SETTINGS  —  click Rebind to assign a custom shortcut",
+                 bg=C_BG, fg=C_MUTED, font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+
+        self._settings_rows_frame = tk.Frame(frame, bg=C_BG)
+        self._settings_rows_frame.pack(fill=tk.X, padx=12, pady=(0, 4))
+
+        footer = tk.Frame(frame, bg=C_BG, padx=12, pady=8)
+        footer.pack(fill=tk.X)
+        reset_btn = tk.Button(footer, text="Reset All to Defaults",
+                              command=self._reset_hotkeys,
+                              bg=C_NAV, fg=C_MUTED,
+                              activebackground=C_NAV_HV, activeforeground=C_TEXT,
+                              relief=tk.FLAT, padx=14, pady=6,
+                              font=("Segoe UI", 9), cursor="hand2")
+        reset_btn.pack(side=tk.LEFT)
+        _hover(reset_btn, C_NAV, C_NAV_HV, C_MUTED, C_TEXT)
+
+        self._rebuild_settings_ui()
+        return frame
+
+    def _reset_hotkeys(self):
+        self.hotkey_config = [dict(h) for h in DEFAULT_HOTKEYS]
+        self._write_config()
+        self._rebuild_settings_ui()
+        self._rebuild_my_windows_ui()
+        self._register_hotkeys()
+
+    def _rebind_hotkey(self, slot_index):
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Rebind Slot {slot_index + 1}")
+        dlg.geometry("400x200")
+        dlg.resizable(False, False)
+        dlg.configure(bg=C_BG)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+
+        cfg     = self.hotkey_config[slot_index]
+        cur_str = self._combo_str(cfg["modifier"], cfg["key"])
+
+        tk.Label(dlg, text=f"Slot {slot_index + 1}  —  Current: {cur_str}",
+                 bg=C_BG, fg=C_MUTED, font=("Segoe UI", 9)).pack(pady=(18, 6))
+
+        status_var = tk.StringVar(value="Hold modifiers, then press a key…")
+        tk.Label(dlg, textvariable=status_var,
+                 bg=C_SURFACE, fg=C_TEXT,
+                 font=("Segoe UI", 10, "bold"),
+                 width=36, pady=12).pack(padx=18, pady=(0, 8))
+
+        tk.Label(dlg, text="Letters, digits, F1–F12  •  Esc to cancel",
+                 bg=C_BG, fg=C_MUTED, font=("Segoe UI", 8)).pack()
+
+        btn_row = tk.Frame(dlg, bg=C_BG, pady=10)
+        btn_row.pack()
+
+        clear_btn = tk.Button(btn_row, text="Clear Binding",
+                              bg=C_NAV, fg=C_MUTED,
+                              activebackground=C_NAV_HV, activeforeground=C_TEXT,
+                              relief=tk.FLAT, padx=12, pady=5,
+                              font=("Segoe UI", 9), cursor="hand2")
+        clear_btn.pack(side=tk.LEFT, padx=(0, 6))
+        _hover(clear_btn, C_NAV, C_NAV_HV, C_MUTED, C_TEXT)
+
+        cancel_btn = tk.Button(btn_row, text="Cancel",
+                               command=dlg.destroy,
+                               bg=C_NAV, fg=C_MUTED,
+                               activebackground=C_NAV_HV, activeforeground=C_TEXT,
+                               relief=tk.FLAT, padx=12, pady=5,
+                               font=("Segoe UI", 9), cursor="hand2")
+        cancel_btn.pack(side=tk.LEFT)
+        _hover(cancel_btn, C_NAV, C_NAV_HV, C_MUTED, C_TEXT)
+
+        # Track modifier state via press/release — more reliable than event.state on Windows
+        ctrl  = [False]
+        alt   = [False]
+        shift = [False]
+        win_  = [False]
+
+        def _update_preview():
+            parts = []
+            if win_[0]:   parts.append("Win")
+            if ctrl[0]:   parts.append("Ctrl")
+            if alt[0]:    parts.append("Alt")
+            if shift[0]:  parts.append("Shift")
+            status_var.set("+".join(parts) + "+…" if parts else "Hold modifiers, then press a key…")
+
+        def _on_press(e):
+            sym = e.keysym
+            if sym in ("Control_L", "Control_R"): ctrl[0]  = True;  _update_preview(); return
+            if sym in ("Alt_L", "Alt_R"):         alt[0]   = True;  _update_preview(); return
+            if sym in ("Shift_L", "Shift_R"):     shift[0] = True;  _update_preview(); return
+            if sym in ("Super_L", "Super_R"):     win_[0]  = True;  _update_preview(); return
+            if sym == "Escape":                   dlg.destroy();     return
+
+            vk = _keysym_to_vk(sym)
+            if vk is None:
+                status_var.set(f"Unsupported key: {sym}")
+                return
+
+            mod = 0
+            if win_[0]:   mod |= MOD_WIN
+            if ctrl[0]:   mod |= MOD_CONTROL
+            if alt[0]:    mod |= MOD_ALT
+            if shift[0]:  mod |= MOD_SHIFT
+
+            if mod == 0:
+                status_var.set("Add a modifier (Ctrl, Alt, Shift, Win)…")
+                return
+
+            key_str = sym.upper() if len(sym) == 1 else sym
+
+            for j, hk in enumerate(self.hotkey_config):
+                if j != slot_index and hk.get("modifier") == mod \
+                        and hk.get("key", "").upper() == key_str.upper():
+                    status_var.set(f"Conflict with Slot {j + 1}! Try another combo.")
+                    return
+
+            self.hotkey_config[slot_index] = {"modifier": mod, "key": key_str}
+            self._write_config()
+            self._rebuild_settings_ui()
+            self._rebuild_my_windows_ui()
+            self._register_hotkeys()
+            dlg.destroy()
+
+        def _on_release(e):
+            sym = e.keysym
+            if sym in ("Control_L", "Control_R"): ctrl[0]  = False
+            if sym in ("Alt_L", "Alt_R"):         alt[0]   = False
+            if sym in ("Shift_L", "Shift_R"):     shift[0] = False
+            if sym in ("Super_L", "Super_R"):     win_[0]  = False
+            _update_preview()
+
+        def _clear():
+            self.hotkey_config[slot_index] = {"modifier": 0, "key": ""}
+            self._write_config()
+            self._rebuild_settings_ui()
+            self._rebuild_my_windows_ui()
+            self._register_hotkeys()
+            dlg.destroy()
+
+        clear_btn.config(command=_clear)
+        dlg.bind("<KeyPress>",   _on_press)
+        dlg.bind("<KeyRelease>", _on_release)
+        dlg.focus_force()
 
     # ── UI rebuild ────────────────────────────────────────────────────────────
 
@@ -482,14 +719,12 @@ class App:
         row = tk.Frame(self._my_inner, bg=C_SURFACE, pady=0)
         row.pack(fill=tk.X, pady=1)
 
-        # Left accent strip — green if alive, gray if not
         tk.Frame(row, bg=C_GREEN if alive else C_GRAY_DOT, width=3).pack(
             side=tk.LEFT, fill=tk.Y)
 
         inner = tk.Frame(row, bg=C_SURFACE, pady=11, padx=10)
         inner.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # ↑ ↓ nav buttons
         nav = tk.Frame(inner, bg=C_SURFACE)
         nav.pack(side=tk.LEFT, padx=(0, 10))
         for symbol, direction in [("↑", -1), ("↓", 1)]:
@@ -502,19 +737,18 @@ class App:
             b.pack(side=tk.LEFT, padx=1)
             _hover(b, C_NAV, C_NAV_HV, C_MUTED, C_TEXT)
 
-        # Title
         tk.Label(inner, text=win["title"], bg=C_SURFACE,
                  fg=C_TEXT if alive else C_MUTED,
                  font=("Segoe UI", 10), anchor="w").pack(
                      side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Hotkey chip
         if i < MAX_HOTKEYS:
-            tk.Label(inner, text=f" Ctrl+Alt+{i + 1} ",
+            cfg   = self.hotkey_config[i]
+            combo = self._combo_str(cfg["modifier"], cfg["key"])
+            tk.Label(inner, text=f" {combo} ",
                      bg=C_AMBER_BG, fg=C_AMBER,
                      font=("Segoe UI", 8), padx=2).pack(side=tk.LEFT, padx=(8, 0))
 
-        # Switch button
         sw = tk.Button(inner, text="Switch",
                        command=lambda h=win["hwnd"]: focus_window(h),
                        bg=C_ACCENT_BG, fg=C_ACCENT,
@@ -526,7 +760,6 @@ class App:
         if alive:
             _hover(sw, C_ACCENT_BG, C_ACCENT_HV)
 
-        # Remove button
         rm = tk.Button(inner, text="×",
                        command=lambda h=win["hwnd"]: self._remove_selected(h),
                        bg=C_SURFACE, fg=C_MUTED,
@@ -555,26 +788,22 @@ class App:
         row = tk.Frame(self._sel_inner, bg=C_SURFACE, cursor="hand2")
         row.pack(fill=tk.X, pady=1)
 
-        # Left selection strip (accent if selected, surface otherwise)
         strip = tk.Frame(row, bg=C_ACCENT if is_sel else C_SURFACE, width=3)
         strip.pack(side=tk.LEFT, fill=tk.Y)
 
         inner = tk.Frame(row, bg=C_SURFACE, pady=10, padx=12)
         inner.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Selection dot
         dot = tk.Label(inner, text="●",
                        bg=C_SURFACE, fg=C_ACCENT if is_sel else C_GRAY_DOT,
                        font=("Segoe UI", 8))
         dot.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Title
         lbl = tk.Label(inner, text=title, bg=C_SURFACE,
                        fg=C_TEXT if is_sel else C_MUTED,
                        font=("Segoe UI", 10), anchor="w")
         lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Hover effect — all widgets except the selection strip
         hover_targets = [row, inner, dot, lbl]
         def on_enter(e, ws=hover_targets):
             for w in ws:
@@ -590,6 +819,42 @@ class App:
             w.bind("<Enter>", on_enter)
             w.bind("<Leave>", on_leave)
             w.bind("<Button-1>", on_click)
+
+    def _rebuild_settings_ui(self):
+        for w in self._settings_rows_frame.winfo_children():
+            w.destroy()
+        for i, cfg in enumerate(self.hotkey_config):
+            self._settings_row(i, cfg)
+
+    def _settings_row(self, i, cfg):
+        row = tk.Frame(self._settings_rows_frame, bg=C_SURFACE, pady=0)
+        row.pack(fill=tk.X, pady=1)
+
+        tk.Frame(row, bg=C_ACCENT_BG, width=3).pack(side=tk.LEFT, fill=tk.Y)
+
+        inner = tk.Frame(row, bg=C_SURFACE, pady=10, padx=14)
+        inner.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        tk.Label(inner, text=f"Slot {i + 1}",
+                 bg=C_SURFACE, fg=C_MUTED,
+                 font=("Segoe UI", 9, "bold"), width=6, anchor="w").pack(side=tk.LEFT)
+
+        has_binding = cfg.get("modifier", 0) != 0 and cfg.get("key", "")
+        combo = self._combo_str(cfg["modifier"], cfg["key"])
+        tk.Label(inner, text=f" {combo} ",
+                 bg=C_AMBER_BG if has_binding else C_SURFACE,
+                 fg=C_AMBER if has_binding else C_MUTED,
+                 font=("Segoe UI", 9), padx=4,
+                 anchor="w").pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
+
+        rebind_btn = tk.Button(inner, text="Rebind",
+                               command=lambda idx=i: self._rebind_hotkey(idx),
+                               bg=C_ACCENT_BG, fg=C_ACCENT,
+                               activebackground=C_ACCENT_HV, activeforeground=C_ACCENT,
+                               relief=tk.FLAT, padx=12, pady=3,
+                               font=("Segoe UI", 9), cursor="hand2")
+        rebind_btn.pack(side=tk.LEFT, padx=(10, 0))
+        _hover(rebind_btn, C_ACCENT_BG, C_ACCENT_HV)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
